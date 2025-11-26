@@ -11,3 +11,7 @@ node_modules
 /target
 /codecov
 /codecov.*
+# Development Docker files (not part of Stencila repo)
+Dockerfile.dev
+docker-compose.yml
+.cargo/config.toml
