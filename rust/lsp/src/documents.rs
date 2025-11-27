@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_lsp::lsp_types::request::Request;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use stencila_codec_utils::git_info;
@@ -83,9 +84,9 @@ pub async fn list() -> EnrichedDocumentTrackingEntries {
         .and_then(|info| info.origin);
 
     // Fetch watch details from API
-    let watch_details_map: HashMap<u64, stencila_cloud::WatchDetailsResponse> =
+    let watch_details_map: HashMap<String, stencila_cloud::WatchDetailsResponse> =
         match stencila_cloud::get_watches(repo_url.as_deref()).await {
-            Ok(watches) => watches.into_iter().map(|w| (w.id, w)).collect(),
+            Ok(watches) => watches.into_iter().map(|w| (w.id.clone(), w)).collect(),
             Err(error) => {
                 tracing::debug!("Failed to fetch watch details from API: {error}");
                 HashMap::new()
@@ -107,7 +108,7 @@ pub async fn list() -> EnrichedDocumentTrackingEntries {
         let remotes_info = if let Some(workspace_dir) = &workspace_dir {
             match stencila_remotes::get_remotes_for_path(&path, Some(workspace_dir)).await {
                 Ok(remotes) => {
-                    let remote_map: BTreeMap<_, _> =
+                    let remote_map: IndexMap<_, _> =
                         remotes.into_iter().map(|r| (r.url.clone(), r)).collect();
                     Some(remote_map)
                 }
@@ -121,7 +122,7 @@ pub async fn list() -> EnrichedDocumentTrackingEntries {
         let remote_statuses = if let Some(ref remotes) = remotes_info {
             calculate_remote_statuses(remotes, doc_status, modified_at).await
         } else {
-            BTreeMap::new()
+            IndexMap::new()
         };
 
         let enriched_remotes = remotes_info.map(|remotes| {
@@ -140,29 +141,66 @@ pub async fn list() -> EnrichedDocumentTrackingEntries {
 
                     // Get watch details if watch_id exists
                     let (watch_status, watch_status_summary, watch_last_error, current_pr) =
-                        if let Some(watch_id_str) = &remote.watch_id {
-                            if let Ok(watch_id) = watch_id_str.parse::<u64>() {
-                                if let Some(details) = watch_details_map.get(&watch_id) {
-                                    let status = Some(details.status.to_string());
-                                    let summary = if !details.status_details.summary.is_empty() {
-                                        Some(details.status_details.summary.clone())
-                                    } else {
-                                        None
-                                    };
-                                    let error = details.status_details.last_error.clone();
-                                    let pr = details.status_details.current_pr.as_ref().map(|pr| {
-                                        PullRequestInfo {
-                                            status: pr.status.clone(),
-                                            url: pr.url.clone(),
-                                        }
-                                    });
-                                    (status, summary, error, pr)
-                                } else {
-                                    (None, None, None, None)
-                                }
+                        if let Some(watch_id) = &remote.watch_id
+                            && let Some(details) = watch_details_map.get(watch_id)
+                        {
+                            use stencila_cloud::WatchDirectionStatus;
+
+                            // Compute overall status from direction statuses
+                            let statuses = [details.from_remote_status, details.to_remote_status];
+                            let overall_status =
+                                statuses.into_iter().flatten().max_by_key(|s| match s {
+                                    WatchDirectionStatus::Ok => 0,
+                                    WatchDirectionStatus::Pending => 1,
+                                    WatchDirectionStatus::Running => 2,
+                                    WatchDirectionStatus::Blocked => 3,
+                                    WatchDirectionStatus::Error => 4,
+                                });
+                            let status = overall_status.map(|s| s.to_string());
+
+                            // Combine errors from both directions for the summary
+                            let errors: Vec<&str> = [
+                                details.last_remote_error.as_deref(),
+                                details.last_repo_error.as_deref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                            let summary = if errors.is_empty() {
+                                None
                             } else {
-                                (None, None, None, None)
-                            }
+                                Some(errors.join("; "))
+                            };
+
+                            // Use whichever error is present
+                            let error = details
+                                .last_remote_error
+                                .clone()
+                                .or_else(|| details.last_repo_error.clone());
+
+                            // Construct PR info if we have a PR number
+                            let pr = details.current_pr_number.map(|pr_number| {
+                                // Try to construct a GitHub PR URL from repo_url
+                                let pr_url = reqwest::Url::parse(&details.repo_url)
+                                    .ok()
+                                    .map(|url| {
+                                        let path = url
+                                            .path()
+                                            .trim_start_matches('/')
+                                            .trim_end_matches(".git");
+                                        format!("https://github.com/{}/pull/{}", path, pr_number)
+                                    })
+                                    .unwrap_or_default();
+
+                                PullRequestInfo {
+                                    status: details
+                                        .current_pr_status
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    url: pr_url,
+                                }
+                            });
+                            (status, summary, error, pr)
                         } else {
                             (None, None, None, None)
                         };

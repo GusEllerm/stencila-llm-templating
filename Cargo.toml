@@ -5,7 +5,7 @@ members = ["rust/*", "node", "python/stencila"]
 exclude = ["rust/codec-polars", "rust/kernel-rhai"]
 
 [workspace.package]
-version = "2.8.0"
+version = "2.9.0"
 
 [workspace.dependencies]
 Inflector = "0.11.4"
@@ -25,6 +25,7 @@ flate2 = "1.1.5"
 futures = "0.3.31"
 glob = "0.3.3"
 governor = { version = "0.10.1", default-features = false, features = ["std"] }
+ignore = "0.4.25"
 headless_chrome = { version = "1.0.18", features = ["rustls"] }
 indexmap = { version = "2.12.0", features = ["serde"] }
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "gif", "tiff"] }
@@ -67,6 +68,7 @@ tar = "0.4.44"
 tempfile = "3.23.0"
 test-log = { version = "0.2.18", default-features = false, features = ["trace"] }
 textwrap = { version = "0.16.2", features = ["terminal_size"] }
+thiserror = "2.0.12"
 time = { version = "0.3.44", features = ["formatting"] }
 tl = "0.7.8"
 tokio = { version = "1.48.0", features = ["full", "tracing"] }

@@ -14,7 +14,9 @@ use stencila_cloud::sites::{
     default_site_url, delete_site, delete_site_branch, delete_site_domain, ensure_site, get_site,
     get_site_domain_status, list_site_branches, set_site_domain, update_site_access,
 };
-use stencila_config::{ConfigTarget, config, config_set, config_unset};
+use stencila_cloud::{AccessMode, WatchRequest, create_watch};
+use stencila_codec_utils::git_info;
+use stencila_config::{ConfigTarget, config, config_set, config_unset, config_update_site_watch};
 
 /// Manage the workspace site
 #[derive(Debug, Parser)]
@@ -113,12 +115,9 @@ impl Show {
         let site = match cfg.site {
             Some(site) => site,
             None => {
-                message(
-                    cstr!(
-                        "No site is enabled for this workspace. To create one, run <b>stencila site create</>"
-                    ),
-                    Some("💡"),
-                );
+                message(cstr!(
+                    "💡 No site is enabled for this workspace. To create one, run <b>stencila site create</>"
+                ));
                 return Ok(());
             }
         };
@@ -180,7 +179,7 @@ impl Show {
             details.access_updated_at.as_deref().unwrap_or("Never")
         );
 
-        message(&info, Some("🌐"));
+        message!("🌐 {info}");
 
         Ok(())
     }
@@ -190,11 +189,35 @@ impl Show {
 #[derive(Debug, Args)]
 #[command(after_long_help = CREATE_AFTER_LONG_HELP)]
 pub struct Create {
-    /// Path to the workspace directory where .stencila/site.yaml will be created
+    /// Root directory for site content
+    ///
+    /// If specified, sets the site.root config value. Files will be published
+    /// from this directory, and routes calculated relative to it.
+    /// Example: `stencila site create docs` publishes from ./docs/
+    root: Option<std::path::PathBuf>,
+
+    /// Path to the workspace directory where stencila.toml will be created
     ///
     /// If not specified, uses the current directory
     #[arg(long, short)]
     path: Option<std::path::PathBuf>,
+
+    /// Set access restrictions for the site
+    #[arg(long, short, value_enum)]
+    access: Option<AccessMode>,
+
+    /// Create a watch for automatic deployment
+    ///
+    /// When changes are pushed to the repository, the site is automatically
+    /// updated. Requires a git repository with an origin remote.
+    #[arg(long, short)]
+    watch: bool,
+
+    /// Set a custom domain for the site
+    ///
+    /// Example: --domain example.com
+    #[arg(long, short, value_parser = parse_domain)]
+    domain: Option<String>,
 }
 
 pub static CREATE_AFTER_LONG_HELP: &str = cstr!(
@@ -202,32 +225,138 @@ pub static CREATE_AFTER_LONG_HELP: &str = cstr!(
   <dim># Create site for the current workspace</dim>
   <b>stencila site create</>
 
-  <dim># Create site for another workspace</dim>
-  <b>stencila site create --path /path/to/workspace</>
+  <dim># Create site with docs/ as the root</dim>
+  <b>stencila site create docs</>
+
+  <dim># Create site with public access</dim>
+  <b>stencila site create --access public</>
+
+  <dim># Create site with password protection</dim>
+  <b>stencila site create --access password</>
+
+  <dim># Create site with team-only access</dim>
+  <b>stencila site create --access team</>
+
+  <dim># Create site with automatic deployment on git push</dim>
+  <b>stencila site create --watch</>
+
+  <dim># Create site with a custom domain</dim>
+  <b>stencila site create --domain example.com</>
+
+  <dim># Combine options</dim>
+  <b>stencila site create docs --access public --watch --domain docs.example.com</>
 "
 );
 
 impl Create {
     pub async fn run(self) -> Result<()> {
-        let path = self.path.map_or_else(current_dir, Ok)?;
+        let workspace_path = self.path.map_or_else(current_dir, Ok)?;
 
-        let (site_id, already_existed) = ensure_site(&path).await?;
+        // 1. Create the site
+        let (site_id, already_existed) = ensure_site(&workspace_path).await?;
 
-        // Get the domain from config (if any)
-        let cfg = config(&path)?;
+        // 2. Set site.root if provided
+        if let Some(root) = &self.root {
+            let root_str = root.to_string_lossy();
+            config_set("site.root", root_str.as_ref(), ConfigTarget::Nearest)?;
+        }
+
+        // 3. Set access mode if provided
+        if let Some(access) = self.access {
+            match access {
+                AccessMode::Public | AccessMode::Team => {
+                    update_site_access(&site_id, Some(access), None, None).await?;
+                }
+                AccessMode::Password => {
+                    let password = ask_for_password("Enter password for site access").await?;
+                    update_site_access(&site_id, Some(access), Some(Some(password.as_str())), None)
+                        .await?;
+                }
+            }
+        }
+
+        // 4. Set domain if provided
+        let mut domain_instructions: Option<String> = None;
+        if let Some(domain) = &self.domain {
+            let response = set_site_domain(&site_id, domain).await?;
+            config_set("site.domain", domain, ConfigTarget::Nearest)?;
+
+            // Prepare CNAME instructions if DNS not yet configured
+            if response.status == "pending_dns" {
+                domain_instructions = Some(format_cname_instructions(
+                    &response.cname_record,
+                    &response.cname_target,
+                ));
+            }
+        }
+
+        // 5. Create watch if requested
+        if self.watch {
+            // Check git remote exists
+            let site_path = self
+                .root
+                .as_ref()
+                .map(|r| workspace_path.join(r))
+                .unwrap_or_else(|| workspace_path.clone());
+
+            let git_info = git_info(&site_path)?;
+            let repo_url = git_info
+                .origin
+                .ok_or_else(|| eyre!("--watch requires a git repository with an origin remote"))?;
+
+            // Check not already watched
+            let cfg = config(&workspace_path)?;
+            if cfg.site.as_ref().and_then(|s| s.watch.as_ref()).is_none() {
+                // Get directory path relative to repo root (must end with / for API)
+                let dir_path = git_info.path.unwrap_or_else(|| ".".to_string());
+                let dir_path = if dir_path.ends_with('/') {
+                    dir_path
+                } else {
+                    format!("{dir_path}/")
+                };
+
+                // Build the site URL
+                let site_url = format!("https://{site_id}.stencila.site");
+
+                let request = WatchRequest {
+                    remote_url: site_url,
+                    repo_url,
+                    file_path: dir_path,
+                    direction: Some("to-remote".to_string()),
+                    pr_mode: None,
+                    debounce_seconds: None,
+                };
+
+                let response = create_watch(request).await?;
+                config_update_site_watch(&workspace_path, Some(response.id))?;
+            }
+        }
+
+        // 6. Display success message
+        let cfg = config(&workspace_path)?;
         let domain = cfg.site.and_then(|s| s.domain);
         let url = default_site_url(&site_id, domain.as_deref());
 
         if already_existed {
-            message(
-                &format!("Site already exists for workspace: {url}"),
-                Some("ℹ️"),
-            );
+            message!("ℹ️ Site already exists: {url}");
         } else {
-            message(
-                &format!("Site successfully created for workspace: {url}"),
-                Some("✅"),
-            );
+            message!("✅ Site created: {url}");
+        }
+
+        // Show additional status for new options
+        if let Some(access) = &self.access {
+            message!("   Access: {access}");
+        }
+        if self.watch {
+            message!("   Watch: enabled");
+        }
+        if let Some(domain) = &self.domain {
+            message!("   Domain: {domain}");
+        }
+
+        // Show CNAME instructions if domain was set and needs DNS configuration
+        if let Some(instructions) = domain_instructions {
+            message!("\n{instructions}");
         }
 
         Ok(())
@@ -274,7 +403,7 @@ impl Delete {
         .await?;
 
         if !answer.is_yes() {
-            message("Site deletion cancelled", Some("ℹ️"));
+            message("ℹ️ Site deletion cancelled");
             return Ok(());
         }
 
@@ -284,11 +413,12 @@ impl Delete {
         let stencila_dir = stencila_dirs::closest_stencila_dir(&path, false).await?;
         if let Ok(removed_count) =
             stencila_remotes::remove_site_remotes(&stencila_dir, &site_id).await
-            && removed_count > 0 {
-                tracing::debug!("Removed {removed_count} remote tracking entries");
-            }
+            && removed_count > 0
+        {
+            tracing::debug!("Removed {removed_count} remote tracking entries");
+        }
 
-        message("Site deleted successfully", Some("✅"));
+        message("✅ Site deleted successfully");
 
         Ok(())
     }
@@ -335,12 +465,9 @@ impl Access {
             let site = match cfg.site {
                 Some(site) => site,
                 None => {
-                    message(
-                        cstr!(
-                            "No site is enabled for this workspace. To create one, run <b>stencila site create</>"
-                        ),
-                        Some("💡"),
-                    );
+                    message(cstr!(
+                        "💡 No site is enabled for this workspace. To create one, run <b>stencila site create</>"
+                    ));
                     return Ok(());
                 }
             };
@@ -364,7 +491,7 @@ impl Access {
                 other => other,
             };
 
-            message(&format!("Access mode: {}", access), Some("ℹ️"));
+            message!("ℹ️ Access mode: {}", access);
             return Ok(());
         };
 
@@ -411,14 +538,11 @@ impl AccessPublic {
             .ok_or_else(|| eyre!("Site ID not set in configuration"))?;
         let domain = site.domain.as_deref();
 
-        update_site_access(site_id, Some("public"), None, None).await?;
+        update_site_access(site_id, Some(AccessMode::Public), None, None).await?;
 
-        message(
-            &format!(
-                "Site {} switched to public access",
-                default_site_url(site_id, domain)
-            ),
-            Some("✅"),
+        message!(
+            "✅ Site {} switched to public access",
+            default_site_url(site_id, domain)
         );
 
         Ok(())
@@ -476,23 +600,25 @@ impl AccessPassword {
 
         // First, try to switch to password mode without prompting for password
         // This will succeed if a password hash already exists in the database
-        let result =
-            update_site_access(site_id, Some("password"), None, access_restrict_main).await;
+        let result = update_site_access(
+            site_id,
+            Some(AccessMode::Password),
+            None,
+            access_restrict_main,
+        )
+        .await;
 
         match result {
             Ok(()) => {
                 // Successfully switched to password mode using existing password hash
-                message(
-                    &format!(
-                        "Site {} switched to password-protected access{}",
-                        default_site_url(site_id, domain),
-                        if self.not_main {
-                            " (excluding main/master branches)"
-                        } else {
-                            ""
-                        }
-                    ),
-                    Some("✅"),
+                message!(
+                    "✅ Site {} switched to password-protected access{}",
+                    default_site_url(site_id, domain),
+                    if self.not_main {
+                        " (excluding main/master branches)"
+                    } else {
+                        ""
+                    }
                 );
                 Ok(())
             }
@@ -509,23 +635,20 @@ impl AccessPassword {
                     // Retry with password
                     update_site_access(
                         site_id,
-                        Some("password"),
+                        Some(AccessMode::Password),
                         Some(Some(&password)),
                         access_restrict_main,
                     )
                     .await?;
 
-                    message(
-                        &format!(
-                            "Site {} switched to password-protected access{}",
-                            default_site_url(site_id, domain),
-                            if self.not_main {
-                                " (excluding main/master branches)"
-                            } else {
-                                ""
-                            }
-                        ),
-                        Some("✅"),
+                    message!(
+                        "✅ Site {} switched to password-protected access{}",
+                        default_site_url(site_id, domain),
+                        if self.not_main {
+                            " (excluding main/master branches)"
+                        } else {
+                            ""
+                        }
                     );
 
                     Ok(())
@@ -599,21 +722,18 @@ impl AccessTeam {
             None
         };
 
-        update_site_access(site_id, Some("auth"), None, access_restrict_main).await?;
+        update_site_access(site_id, Some(AccessMode::Team), None, access_restrict_main).await?;
 
-        message(
-            &format!(
-                "Site {} switched to team-only access{}",
-                default_site_url(site_id, domain),
-                if self.not_main {
-                    " (excluding main/master branches)"
-                } else if self.main {
-                    " (including main/master branches)"
-                } else {
-                    ""
-                }
-            ),
-            Some("✅"),
+        message!(
+            "✅ Site {} switched to team-only access{}",
+            default_site_url(site_id, domain),
+            if self.not_main {
+                " (excluding main/master branches)"
+            } else if self.main {
+                " (including main/master branches)"
+            } else {
+                ""
+            }
         );
 
         Ok(())
@@ -746,13 +866,10 @@ impl PasswordSet {
             ""
         };
 
-        message(
-            &format!(
-                "Password updated for {}{}",
-                default_site_url(site_id, domain),
-                mode_msg
-            ),
-            Some("✅"),
+        message!(
+            "✅ Password updated for {}{}",
+            default_site_url(site_id, domain),
+            mode_msg
         );
 
         Ok(())
@@ -809,19 +926,16 @@ impl PasswordClear {
         .await?;
 
         if !answer.is_yes() {
-            message("Password clear cancelled", Some("ℹ️"));
+            message("ℹ️ Password clear cancelled");
             return Ok(());
         }
 
         // Call API to clear password (pass Some(None) to explicitly set password to null)
         update_site_access(site_id, None, Some(None), None).await?;
 
-        message(
-            &format!(
-                "Password cleared from {}",
-                default_site_url(site_id, domain)
-            ),
-            Some("✅"),
+        message!(
+            "✅ Password cleared from {}",
+            default_site_url(site_id, domain)
         );
 
         Ok(())
@@ -972,53 +1086,42 @@ impl DomainSet {
                 let cname_instructions =
                     format_cname_instructions(&response.cname_record, &response.cname_target);
 
-                message(
-                    &format!(
-                        "Custom domain `{}` set for site `{}`\n\n\
-                        To complete setup:\n\n\
-                        1. {}\n\n\
-                        2. Wait for DNS propagation (usually 5-30 minutes)\n\n\
-                        3. Check status with: *stencila site domain status*\n\n\
-                        Once the CNAME is detected, SSL will be provisioned automatically and your site will go live.",
-                        response.domain, site_id, cname_instructions
-                    ),
-                    Some("⏳"),
+                message!(
+                    "⏳ Custom domain `{}` set for site `{}`\n\n\
+                    To complete setup:\n\n\
+                    1. {}\n\n\
+                    2. Wait for DNS propagation (usually 5-30 minutes)\n\n\
+                    3. Check status with: *stencila site domain status*\n\n\
+                    Once the CNAME is detected, SSL will be provisioned automatically and your site will go live.",
+                    response.domain,
+                    site_id,
+                    cname_instructions
                 );
             }
             "ssl_initializing"
             | "ssl_pending_validation"
             | "ssl_pending_issuance"
             | "ssl_pending_deployment" => {
-                message(
-                    &format!("🔄 SSL provisioning started for `{}`", response.domain),
-                    None,
-                );
+                message!("🔄 SSL provisioning started for `{}`", response.domain);
                 if let Some(true) = response.cname_configured {
                     message(
                         "\nCNAME record detected! SSL certificate is being provisioned...\n\n\
                         Check status with: *stencila site domain status*",
-                        None,
                     );
                 } else {
                     let cname_instructions =
                         format_cname_instructions(&response.cname_record, &response.cname_target);
 
-                    message(
-                        &format!(
-                            "\nTo complete setup:\n\n\
-                            1. {}\n\n\
-                            2. Monitor progress with: *stencila site domain status*",
-                            cname_instructions
-                        ),
-                        None,
+                    message!(
+                        "\nTo complete setup:\n\n\
+                        1. {}\n\n\
+                        2. Monitor progress with: *stencila site domain status*",
+                        cname_instructions
                     );
                 }
             }
             "active" => {
-                message(
-                    &format!("Your site is now live at https://{}", response.domain),
-                    Some("🎉"),
-                );
+                message!("🎉 Your site is now live at https://{}", response.domain);
             }
             "failed" => {
                 bail!(
@@ -1027,7 +1130,7 @@ impl DomainSet {
                 );
             }
             _ => {
-                message(&format!("Status: {}", response.status), Some("🔄"));
+                message!("🔄 Status: {}", response.status);
             }
         }
 
@@ -1074,14 +1177,11 @@ impl DomainStatus {
         let status = get_site_domain_status(site_id).await?;
 
         if !status.configured {
-            message("No custom domain is configured for this site", Some("ℹ️"));
+            message("ℹ️ No custom domain is configured for this site");
         } else if let Some("active") = status.status.as_deref()
             && let Some(domain) = &status.domain
         {
-            message(
-                &format!("Your site is live at https://{domain}"),
-                Some("🎉"),
-            );
+            message!("🎉 Your site is live at https://{domain}");
         } else {
             let emoji = match status.status.as_deref() {
                 Some("active") => "✅",
@@ -1106,7 +1206,7 @@ impl DomainStatus {
                 parts.push(format_cname_instructions(cname_record, cname_target));
             }
 
-            message(&parts.join("\n "), Some(emoji));
+            message!("{emoji} {}", parts.join("\n "));
         }
 
         Ok(())
@@ -1150,7 +1250,7 @@ impl DomainClear {
         // Check if a domain is configured before prompting
         let status = get_site_domain_status(site_id).await?;
         if !status.configured {
-            message("No custom domain is configured for this site", Some("ℹ️"));
+            message("ℹ️ No custom domain is configured for this site");
             return Ok(());
         }
 
@@ -1169,7 +1269,7 @@ impl DomainClear {
         .await?;
 
         if !answer.is_yes() {
-            message("Domain removal cancelled", Some("ℹ️"));
+            message("ℹ️ Domain removal cancelled");
             return Ok(());
         }
 
@@ -1179,12 +1279,9 @@ impl DomainClear {
         // Clear domain from config
         config_unset("site.domain", ConfigTarget::Nearest)?;
 
-        message(
-            &format!(
-                "Custom domain removed from site {}",
-                default_site_url(site_id, None)
-            ),
-            Some("✅"),
+        message!(
+            "✅ Custom domain removed from site {}",
+            default_site_url(site_id, None)
         );
 
         Ok(())
@@ -1266,20 +1363,14 @@ impl BranchList {
         let branches = list_site_branches(site_id).await?;
 
         if branches.is_empty() {
-            message(
-                "No branches have been deployed to this site yet",
-                Some("ℹ️"),
-            );
+            message("ℹ️ No branches have been deployed to this site yet");
             return Ok(());
         }
 
         // Display header message
-        message(
-            &format!(
-                "Deployed branches for site {}:\n",
-                default_site_url(site_id, domain)
-            ),
-            None,
+        message!(
+            "Deployed branches for site {}:\n",
+            default_site_url(site_id, domain)
         );
 
         // Create and populate table
@@ -1394,7 +1485,7 @@ impl BranchDelete {
             .await?;
 
             if !answer.is_yes() {
-                message("Branch deletion cancelled", Some("ℹ️"));
+                message("ℹ️ Branch deletion cancelled");
                 return Ok(());
             }
         }
@@ -1402,12 +1493,9 @@ impl BranchDelete {
         // Call API to delete branch
         delete_site_branch(site_id, &self.branch_name).await?;
 
-        message(
-            &format!(
-                "Branch '{}' deletion started. Files will be removed in the background.",
-                self.branch_name
-            ),
-            Some("✅"),
+        message!(
+            "✅ Branch '{}' deletion started. Files will be removed in the background.",
+            self.branch_name
         );
 
         Ok(())

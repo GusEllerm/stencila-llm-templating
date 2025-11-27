@@ -1,0 +1,16 @@
+[package]
+name = "stencila-spread"
+edition = "2024"
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+regex = { workspace = true }
+stencila-cli-utils = { path = "../cli-utils" }
+strum = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

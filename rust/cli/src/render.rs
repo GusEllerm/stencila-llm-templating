@@ -4,10 +4,14 @@ use clap::Parser;
 use eyre::{Result, bail, eyre};
 
 use stencila_ask::{Answer, AskLevel, AskOptions, ask_with};
-use stencila_cli_utils::{Code, ToStdout, color_print::cstr};
+use stencila_cli_utils::{Code, ToStdout, color_print::cstr, message};
 use stencila_document::Document;
 use stencila_format::Format;
 use stencila_node_execute::ExecuteOptions;
+use stencila_spread::{
+    SpreadConfig, SpreadMode, apply_template, auto_append_placeholders_for_spread,
+    infer_spread_mode,
+};
 
 use crate::{
     open,
@@ -35,9 +39,23 @@ pub struct Cli {
     /// will be rendered to `stdout` in that format.
     outputs: Vec<PathBuf>,
 
-    /// Ignore any errors while executing document
-    #[arg(long)]
-    ignore_errors: bool,
+    /// Enable multi-variant (spread) execution mode
+    ///
+    /// When enabled, parameters with comma-separated values are expanded
+    /// and the document is rendered multiple times.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "grid")]
+    spread: Option<SpreadMode>,
+
+    /// Maximum number of runs allowed in spread mode (default: 100)
+    #[arg(long, default_value = "100")]
+    spread_max: usize,
+
+    /// Explicit parameter sets for cases mode
+    ///
+    /// Each --case takes a quoted string with space-separated key=value pairs.
+    /// Only used with --spread=cases.
+    #[arg(long, value_name = "PARAMS", action = clap::ArgAction::Append)]
+    case: Vec<String>,
 
     /// Do not store the document after executing it
     #[arg(long)]
@@ -88,6 +106,15 @@ pub static CLI_AFTER_LONG_HELP: &str = cstr!(
 
   <dim># Render without updating the document store</dim>
   <b>stencila render</b> <g>temp.md</g> <g>output.html</g> <c>--no-store</c>
+
+  <dim># Spread render with multiple parameter combinations (grid)</dim>
+  <b>stencila render</b> <g>report.md</g> <g>'report-{region}-{species}.pdf'</g> -- <c>region</c>=<g>north,south</g> <c>species</c>=<g>ABC,DEF</g>
+
+  <dim># Spread render with positional pairing (zip) and output to nested folders</dim>
+  <b>stencila render</b> <g>report.md</g> <g>'{region}/{species}/report.pdf'</g> <c>--spread=zip</c> -- <c>region</c>=<g>north,south</g> <c>species</c>=<g>ABC,DEF</g>
+
+  <dim># Spread render with explicit cases</dim>
+  <b>stencila render</b> <g>report.md</g> <g>'report-{i}.pdf'</g> <c>--spread=cases</c> <c>--case</c>=<y>\"region=north species=ABC\"</y> <c>--case</c>=<y>\"region=south species=DEF\"</y>
 "
 );
 
@@ -172,6 +199,39 @@ impl Cli {
         Ok(parsed)
     }
 
+    /// Handle execution errors with optional user interaction
+    ///
+    /// Returns `true` if rendering should continue, `false` if it should stop.
+    async fn handle_execution_errors(&self, errors: usize, context: &str) -> Result<bool> {
+        if errors == 0 {
+            return Ok(true);
+        }
+
+        if self.execute_options.ignore_errors {
+            message!("▶️ Ignoring {errors} execution errors");
+            return Ok(true);
+        }
+
+        // Interactive prompt
+        if ask_with(
+            &format!("Errors while executing `{context}`. Continue rendering?"),
+            AskOptions {
+                level: AskLevel::Warning,
+                default: Some(Answer::Yes),
+                ..Default::default()
+            },
+        )
+        .await?
+        .is_yes()
+        {
+            message("💡 Tip: use `--ignore-errors` to continue without prompts");
+            Ok(true)
+        } else {
+            message("🛑 Stopping due to execution errors");
+            Ok(false)
+        }
+    }
+
     #[allow(clippy::print_stderr)]
     pub async fn run(self) -> Result<()> {
         let input = &self.input;
@@ -179,14 +239,15 @@ impl Cli {
         let arguments = self.arguments()?;
 
         let input_path = input.clone().unwrap_or_else(|| PathBuf::from("-"));
-        let input_stdin = input_path == PathBuf::from("-");
-        let input_display = if input_stdin {
+        let input_is_stdin = input_path == PathBuf::from("-");
+        let input_display = if input_is_stdin {
             "stdin".to_string()
         } else {
             input_path.to_string_lossy().to_string()
         };
 
-        let doc = if input_stdin {
+        // Open document
+        let doc = if input_is_stdin {
             let mut decode_options = self.decode_options.build(None, StripOptions::default());
             if decode_options.format.is_none() {
                 decode_options.format = Some(Format::Markdown)
@@ -201,93 +262,224 @@ impl Cli {
             Document::open(&input_path, Some(decode_options)).await?
         };
 
+        // Compile document (only needs to be done once)
         doc.compile().await?;
-        doc.call(&arguments, self.execute_options.clone()).await?;
-        let (errors, ..) = doc.diagnostics_print().await?;
 
-        if !self.no_store && !input_stdin {
-            doc.store().await?;
-        }
-
-        if errors > 0 {
-            if self.ignore_errors {
-                eprintln!("▶️  Ignoring execution errors")
-            } else if ask_with(
-                &format!("Errors while executing `{input_display}`. Continue rendering?"),
-                AskOptions {
-                    level: AskLevel::Warning,
-                    default: Some(Answer::Yes),
-                    ..Default::default()
-                },
-            )
-            .await?
-            .is_yes()
-            {
-                eprintln!("▶️  Tip: use `--ignore-errors` to continue without being asked")
-            } else {
-                eprintln!(
-                    "🛑 Stopping due to execution errors (Tip: use `--ignore-errors` to continue without being asked)"
-                );
-                exit(1)
+        // Infer spread mode if not explicitly set
+        let mode = self.spread.or_else(|| {
+            // If --case args provided, default to cases mode
+            if !self.case.is_empty() {
+                return Some(SpreadMode::Cases);
             }
-        }
 
-        if outputs.is_empty() {
-            if let Some(format) = self
-                .encode_options
-                .to
-                .as_ref()
-                .map(|format| Format::from_name(format))
-                .or_else(|| input_stdin.then_some(Format::Markdown))
+            // Check output template for placeholders with multi-valued args
+            if outputs.len() == 1
+                && let Some(mode) = infer_spread_mode(&outputs[0].to_string_lossy(), &arguments)
             {
-                // If a `--to` format was supplied, or input was stdin (i.e. no
-                // path to review in the browser) then dump to console
-                let content = doc
-                    .dump(
-                        format.clone(),
+                message!("ℹ️ Auto-detected spread mode `{mode}` from output path template");
+                return Some(mode);
+            }
+            None
+        });
+
+        if let Some(mode) = mode {
+            // Validate: --case is only valid with --spread=cases
+            if !self.case.is_empty() && mode != SpreadMode::Cases {
+                bail!("`--case` is only valid with `--spread=cases`, not `--spread={mode}`");
+            }
+
+            if self.execute_options.dry_run {
+                message("⚠️ Performing dry-run, no files will be actually rendered");
+            }
+
+            // Build spread config
+            let config =
+                SpreadConfig::from_arguments(mode, &arguments, &self.case, self.spread_max)?;
+            let run_count = config.validate()?;
+            let runs = config.generate_runs()?;
+
+            // Spread mode requires exactly one output
+            let output_template = if outputs.is_empty() {
+                bail!("Spread mode requires an output path template");
+            } else if outputs.len() > 1 {
+                bail!(
+                    "Spread mode only supports one output path template (got {})",
+                    outputs.len()
+                );
+            } else {
+                auto_append_placeholders_for_spread(
+                    &outputs[0],
+                    mode,
+                    &config.params,
+                    &config.cases,
+                )
+            };
+
+            message!("📊 Spread rendering {input_display} ({mode} mode, {run_count} runs)");
+
+            // Emit spread warnings
+            for warning in config.check_warnings(run_count, &output_template, &self.arguments) {
+                message!("⚠️ {}", warning.message());
+            }
+
+            // Execute each run
+            for run in &runs {
+                let output_path_str = apply_template(&output_template.to_string_lossy(), run)?;
+                let output_path = PathBuf::from(&output_path_str);
+
+                message!(
+                    "📃 Rendering {}/{}: {} → `{}`",
+                    run.index,
+                    run_count,
+                    run.to_terminal(),
+                    output_path.display()
+                );
+
+                // Dry run: continue without rendering
+                if self.execute_options.dry_run {
+                    continue;
+                }
+
+                // Build arguments from run params
+                let run_arguments: Vec<(&str, &str)> = run
+                    .values
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                // Call document with arguments for this run
+                doc.call(&run_arguments, self.execute_options.clone())
+                    .await?;
+                let (errors, ..) = doc.diagnostics_print().await?;
+
+                // Error handling
+                if !self
+                    .handle_execution_errors(errors, &format!("run {}", run.index))
+                    .await?
+                {
+                    exit(3);
+                }
+
+                // Export document to output path
+                let completed = doc
+                    .export(
+                        &output_path,
                         Some(stencila_codecs::EncodeOptions {
                             render: Some(true),
                             ..self.encode_options.build(
                                 input.as_deref(),
-                                None,
+                                Some(&output_path),
                                 Format::Markdown,
-                                self.strip_options,
+                                self.strip_options.clone(),
                             )
                         }),
                     )
                     .await?;
-                Code::new(format, &content).to_stdout();
-            } else if let Some(input) = input {
-                // Otherwise render the path in the browser
-                open::Cli::new(input.to_path_buf()).run().await?;
+
+                if !completed {
+                    message("⏭️ Skipped (no changes)");
+                }
             }
 
-            return Ok(());
-        }
+            message!("✅ Spread render complete: {run_count} runs finished successfully");
+        } else {
+            // Dry-run: just print what would be rendered and exit
+            if self.execute_options.dry_run {
+                if outputs.is_empty() {
+                    if let Some(format) = self
+                        .encode_options
+                        .to
+                        .as_ref()
+                        .map(|format| Format::from_name(format))
+                        .or_else(|| input_is_stdin.then_some(Format::Markdown))
+                    {
+                        message!("📋 Would render: {input_display} → stdout ({format})");
+                    } else {
+                        message!("📋 Would render: {input_display} → browser");
+                    }
+                } else {
+                    for output in outputs {
+                        message!("📋 Would render: {input_display} → {}", output.display());
+                    }
+                }
+                message("✅ Preview complete (no files rendered)");
+                return Ok(());
+            }
 
-        for output in outputs {
-            let completed = doc
-                .export(
-                    output,
-                    Some(stencila_codecs::EncodeOptions {
-                        render: Some(true),
-                        ..self.encode_options.build(
-                            input.as_deref(),
-                            Some(output),
-                            Format::Markdown,
-                            self.strip_options.clone(),
+            // Call document with arguments
+            doc.call(&arguments, self.execute_options.clone()).await?;
+            let (errors, ..) = doc.diagnostics_print().await?;
+
+            // Cache the document
+            if !self.no_store && !input_is_stdin {
+                doc.store().await?;
+            }
+
+            // Error handling
+            if !self.handle_execution_errors(errors, &input_display).await? {
+                exit(1);
+            }
+
+            // If no outputs, print to console or open in browser
+            if outputs.is_empty() {
+                if let Some(format) = self
+                    .encode_options
+                    .to
+                    .as_ref()
+                    .map(|format| Format::from_name(format))
+                    .or_else(|| input_is_stdin.then_some(Format::Markdown))
+                {
+                    // Print to console
+                    let content = doc
+                        .dump(
+                            format.clone(),
+                            Some(stencila_codecs::EncodeOptions {
+                                render: Some(true),
+                                ..self.encode_options.build(
+                                    input.as_deref(),
+                                    None,
+                                    Format::Markdown,
+                                    self.strip_options,
+                                )
+                            }),
                         )
-                    }),
-                )
-                .await?;
+                        .await?;
+                    Code::new(format, &content).to_stdout();
+                } else if let Some(input) = input {
+                    // Render in browser
+                    // TODO: opening like this is temporary because (a) `open::Cli` might also open
+                    // remotes, (b) needs to re-open doc from file, (b) is not aware of arguments passed.
+                    open::Cli::new(input.to_path_buf()).run().await?;
+                }
 
-            if completed {
-                eprintln!(
-                    "📑 Successfully rendered `{input_display}` to `{}`",
-                    output.display()
-                )
-            } else {
-                eprintln!("⏭️  Skipped rendering `{input_display}`")
+                return Ok(());
+            }
+
+            // Export document to output paths
+            for output in outputs {
+                let completed = doc
+                    .export(
+                        output,
+                        Some(stencila_codecs::EncodeOptions {
+                            render: Some(true),
+                            ..self.encode_options.build(
+                                input.as_deref(),
+                                Some(output),
+                                Format::Markdown,
+                                self.strip_options.clone(),
+                            )
+                        }),
+                    )
+                    .await?;
+
+                if completed {
+                    eprintln!(
+                        "📑 Successfully rendered `{input_display}` to `{}`",
+                        output.display()
+                    )
+                } else {
+                    eprintln!("⏭️  Skipped rendering `{input_display}`")
+                }
             }
         }
 

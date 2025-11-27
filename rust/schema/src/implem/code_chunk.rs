@@ -172,7 +172,6 @@ impl LatexCodec for CodeChunk {
                                 true,
                                 context.highlight,
                                 context.reproducible,
-                                context.prelude.clone(),
                             );
 
                             if latex.trim().is_empty() {
@@ -626,5 +625,19 @@ impl MarkdownCodec for CodeChunk {
 
             context.exit_node().newline();
         }
+    }
+}
+
+impl TextCodec for CodeChunk {
+    fn to_text(&self) -> String {
+        // If any outputs then render those to text (i.e. similar to render mode for Markdown),
+        // otherwise, encode the code.
+        let content = if let Some(outputs) = &self.outputs {
+            outputs.to_text()
+        } else {
+            self.code.to_text()
+        };
+
+        [&content, "\n\n"].concat()
     }
 }

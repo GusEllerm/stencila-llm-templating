@@ -2,21 +2,56 @@
 //!
 //! Functions for interacting with Stencila Sites via the Cloud API.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use chrono::DateTime;
+use clap::ValueEnum;
 use eyre::{Result, bail, eyre};
 use flate2::{Compression, write::GzEncoder};
 use reqwest::Client;
 use reqwest::header::LAST_MODIFIED;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use tokio::fs::read;
 use url::Url;
 
 use stencila_config::{ConfigTarget, config, config_set, config_unset};
 
 use crate::{api_token, base_url, check_response, process_response};
+
+/// Access restriction mode for a site
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AccessMode {
+    /// Anyone can view the site
+    Public,
+    /// Requires a password to view
+    Password,
+    /// Only authenticated team members can view
+    Team,
+}
+
+impl AccessMode {
+    /// Get the API value for this access mode
+    pub fn api_value(&self) -> &'static str {
+        match self {
+            AccessMode::Public => "public",
+            AccessMode::Password => "password",
+            AccessMode::Team => "auth",
+        }
+    }
+}
+
+impl std::fmt::Display for AccessMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessMode::Public => write!(f, "public"),
+            AccessMode::Password => write!(f, "password"),
+            AccessMode::Team => write!(f, "team"),
+        }
+    }
+}
 
 /// Helper to get the site URL
 ///
@@ -212,21 +247,83 @@ pub async fn last_modified(url: &Url) -> Result<u64> {
     Ok(timestamp)
 }
 
+/// Get ETags for a list of storage paths on a site branch
+///
+/// Used for incremental pushes: compare local content hashes with server ETags
+/// to skip uploading unchanged files.
+///
+/// # Arguments
+///
+/// * `site_id` - The site identifier
+/// * `branch_slug` - The branch slug (e.g., "main", "feature-foo")
+/// * `paths` - List of storage paths to get ETags for
+///
+/// # Returns
+///
+/// A map of storage path to ETag (quoted MD5 hex string like `"abc123..."`).
+/// Paths that don't exist on the server are omitted from the response.
+#[tracing::instrument]
+pub async fn get_etags(
+    site_id: &str,
+    branch_slug: &str,
+    paths: Vec<String>,
+) -> Result<HashMap<String, String>> {
+    let token = api_token()
+        .ok_or_else(|| eyre!("No STENCILA_API_TOKEN environment variable or keychain entry found. Please set your API token."))?;
+
+    tracing::debug!("Getting ETags for {} paths", paths.len());
+
+    let client = Client::new();
+    let response = client
+        .post(format!(
+            "{}/sites/{site_id}/{branch_slug}/etags",
+            base_url()
+        ))
+        .bearer_auth(token)
+        .json(&paths)
+        .send()
+        .await?;
+
+    process_response(response).await
+}
+
+/// Request to reconcile files at a prefix
+#[skip_serializing_none]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileRequest {
+    /// List of file paths currently at this location
+    pub paths: Vec<String>,
+
+    /// The GitHub repository URL (for PR comments)
+    pub repo_url: Option<String>,
+
+    /// The branch name (for PR comments)
+    pub branch_name: Option<String>,
+}
+
 /// Reconcile files at a prefix by cleaning up orphaned files
 ///
 /// This function sends a list of current files to the Stencila Cloud API,
 /// which will compare them with files in the bucket at the given prefix
 /// and delete orphaned files.
 ///
+/// If not on a default branch (main/master) and repo_url is provided,
+/// the request includes PR comment info.
+///
 /// # Arguments
 ///
 /// * `site_id` - The site identifier
+/// * `repo_url` - The GitHub repository URL (empty string if not available)
+/// * `branch_name` - The branch name (e.g., "main", "feature/foo")
 /// * `branch_slug` - The branch slug (e.g., "main", "feature-foo")
 /// * `prefix` - The storage path prefix (e.g., "media/", "report/media/")
 /// * `current_files` - List of filenames (without prefix) currently at this location
 #[tracing::instrument]
 pub async fn reconcile_prefix(
     site_id: &str,
+    repo_url: &str,
+    branch_name: &str,
     branch_slug: &str,
     prefix: &str,
     current_files: Vec<String>,
@@ -239,6 +336,20 @@ pub async fn reconcile_prefix(
         current_files.len()
     );
 
+    // Include PR comment info only for non-default branches with a repo URL
+    let (repo_url, branch_name) =
+        if !repo_url.is_empty() && branch_slug != "main" && branch_slug != "master" {
+            (Some(repo_url.to_string()), Some(branch_name.to_string()))
+        } else {
+            (None, None)
+        };
+
+    let request = ReconcileRequest {
+        paths: current_files,
+        repo_url,
+        branch_name,
+    };
+
     let client = Client::new();
     let response = client
         .post(format!(
@@ -246,7 +357,7 @@ pub async fn reconcile_prefix(
             base_url()
         ))
         .bearer_auth(token)
-        .json(&current_files)
+        .json(&request)
         .send()
         .await?;
 
@@ -307,13 +418,13 @@ pub async fn delete_site(path: &Path) -> Result<String> {
 /// # Arguments
 ///
 /// * `site_id` - The site identifier
-/// * `access_restriction` - Optional access mode: "public", "password", or "auth"
+/// * `access_mode` - Optional access mode to set
 /// * `password` - Optional password to set (use Some(None) to clear password)
 /// * `access_restrict_main` - Optional flag for whether main/master branches are restricted
 #[tracing::instrument(skip(password))]
 pub async fn update_site_access(
     site_id: &str,
-    access_restriction: Option<&str>,
+    access_mode: Option<AccessMode>,
     password: Option<Option<&str>>,
     access_restrict_main: Option<bool>,
 ) -> Result<()> {
@@ -324,10 +435,10 @@ pub async fn update_site_access(
 
     let mut json = serde_json::Map::new();
 
-    if let Some(mode) = access_restriction {
+    if let Some(mode) = access_mode {
         json.insert(
             "accessRestriction".to_string(),
-            serde_json::Value::String(mode.to_string()),
+            serde_json::Value::String(mode.api_value().to_string()),
         );
     }
 

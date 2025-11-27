@@ -39,6 +39,7 @@ use std::{
 
 use clap::ValueEnum;
 use eyre::Result;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use strum::{Display, EnumString};
@@ -55,7 +56,7 @@ pub use service::RemoteService;
 ///
 /// Maps file paths to a map of remote URLs to tracking data.
 /// URLs are serialized as strings in JSON but use Url type in Rust.
-pub type RemoteEntries = BTreeMap<PathBuf, BTreeMap<Url, RemoteInfo>>;
+pub type RemoteEntries = BTreeMap<PathBuf, IndexMap<Url, RemoteInfo>>;
 
 /// Remote information combining config and tracking data
 ///
@@ -86,6 +87,13 @@ pub struct RemoteInfo {
 
     /// The watch direction (from stencila.toml or Cloud API)
     pub watch_direction: Option<WatchDirection>,
+
+    /// Arguments used when pushing to this remote (for spread variants)
+    ///
+    /// When a document is pushed with spread parameters, each variant is tracked
+    /// with its specific argument values. This allows matching variants on
+    /// subsequent pushes.
+    pub arguments: Option<std::collections::HashMap<String, String>>,
 }
 
 impl RemoteInfo {
@@ -201,21 +209,25 @@ pub const REMOTE_TOLERANCE_SECS: u64 = 30;
 ///
 /// Returns a map of URL to (remote_modified_at, status) tuples
 pub async fn calculate_remote_statuses(
-    remotes: &BTreeMap<Url, RemoteInfo>,
+    remotes: &IndexMap<Url, RemoteInfo>,
     local_status: RemoteStatus,
     local_modified_at: Option<u64>,
-) -> BTreeMap<Url, (Option<u64>, RemoteStatus)> {
+) -> IndexMap<Url, (Option<u64>, RemoteStatus)> {
     use futures::future::join_all;
 
     if remotes.is_empty() {
-        return BTreeMap::new();
+        return IndexMap::new();
     }
 
     // Create futures to fetch metadata for each remote
     let futures = remotes.iter().map(|(url, remote)| async move {
+        // Check if this is a write-only remote (like Stencila Sites)
+        let service = RemoteService::from_url(url);
+        let is_write_only = service.map(|s| s.is_write_only()).unwrap_or(false);
+
         // Fetch metadata from remote service
         let remote_modified_at = async {
-            match RemoteService::from_url(url) {
+            match service {
                 Some(RemoteService::GoogleDocs) => stencila_codec_gdoc::modified_at(url).await,
                 Some(RemoteService::Microsoft365) => stencila_codec_m365::modified_at(url).await,
                 Some(RemoteService::StencilaSites) => stencila_codec_site::modified_at(url).await,
@@ -229,12 +241,30 @@ pub async fn calculate_remote_statuses(
 
         // Calculate status by comparing local/remote modified times with pushed_at/pulled_at
         let status = if local_status == RemoteStatus::Deleted {
-            // Only mark as Ahead if we can confirm the remote exists
-            if remote_modified_at.is_some() {
+            // For write-only remotes, deleted local files just need to be untracked
+            // For other remotes, mark as Ahead if remote exists (suggesting pull)
+            if is_write_only {
+                RemoteStatus::Unknown
+            } else if remote_modified_at.is_some() {
                 RemoteStatus::Ahead
             } else {
                 // Remote metadata unavailable - could be deleted, network issue, etc.
                 RemoteStatus::Unknown
+            }
+        } else if is_write_only {
+            // For write-only remotes (e.g., Stencila Sites), only show Behind or Synced
+            // - Never "Diverged" (can't pull to reconcile)
+            // - Never "Ahead" (remote changes don't matter, can't pull them)
+            match (local_modified_at, remote.pushed_at) {
+                (Some(local), Some(pushed)) => {
+                    if local > pushed.saturating_add(LOCAL_TOLERANCE_SECS) {
+                        RemoteStatus::Behind // Local changed, need to push
+                    } else {
+                        RemoteStatus::Synced
+                    }
+                }
+                (Some(_), None) => RemoteStatus::Behind, // Never pushed, need to push
+                _ => RemoteStatus::Unknown,
             }
         } else {
             match (
@@ -309,7 +339,7 @@ pub async fn calculate_remote_statuses(
         (url.clone(), (remote_modified_at, status))
     });
 
-    // Execute all futures in parallel and collect results into a BTreeMap
+    // Execute all futures in parallel and collect results into a IndexMap
     join_all(futures).await.into_iter().collect()
 }
 
@@ -431,13 +461,11 @@ fn find_remotes_for_path(
 
         // Check if file matches this remote's path
         if path_matches(&config_relative, &relative_path, workspace_dir)? {
-            // Add all targets for this path
+            // Add all targets for this path (skip Spread targets which don't have URLs)
             for target in value.to_vec() {
-                matches.push((
-                    path_key.clone(),
-                    target.url_owned(),
-                    target.watch().map(|s| s.to_string()),
-                ));
+                if let Some(url) = target.url_owned() {
+                    matches.push((path_key.clone(), url, target.watch().map(|s| s.to_string())));
+                }
             }
         }
     }
@@ -523,8 +551,57 @@ pub async fn get_remotes_for_path(
             pushed_at: existing.and_then(|e| e.pushed_at),
             watch_id,
             watch_direction: None, // Will be filled from Cloud API later if needed
+            arguments: existing.and_then(|e| e.arguments.clone()),
         });
     }
+
+    Ok(results)
+}
+
+/// Get all tracked remotes for a path from the tracking file
+///
+/// Unlike `get_remotes_for_path`, this function reads directly from `.stencila/remotes.json`
+/// and returns all tracked remotes for the given path, including spread variants that may
+/// not have corresponding entries in `stencila.toml`.
+///
+/// This is useful for spread push operations where variants are tracked in the remotes file
+/// but not configured in the TOML config.
+pub async fn get_tracked_remotes_for_path(path: &Path) -> Result<Vec<RemoteInfo>> {
+    let workspace = closest_workspace_dir(path, false).await?;
+    let stencila_dir = match closest_stencila_dir(path, false).await {
+        Ok(dir) => dir,
+        Err(_) => return Ok(Vec::new()), // No .stencila dir means no tracking
+    };
+
+    // Canonicalize path to be relative to workspace
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let relative_path = absolute_path
+        .strip_prefix(&workspace)
+        .unwrap_or(&absolute_path)
+        .to_path_buf();
+
+    // Load tracking data
+    let tracking_entries = read_remote_entries(&stencila_dir).await?;
+
+    // Get all remotes for this path from tracking
+    let Some(remotes_for_path) = tracking_entries.get(&relative_path) else {
+        return Ok(Vec::new());
+    };
+
+    // Convert to Vec<RemoteInfo>, populating url from map key
+    // (url field has #[serde(skip)] so needs to be set from key)
+    let results: Vec<RemoteInfo> = remotes_for_path
+        .iter()
+        .map(|(url, info)| {
+            let mut info = info.clone();
+            info.url = url.clone();
+            info
+        })
+        .collect();
 
     Ok(results)
 }
@@ -542,12 +619,16 @@ pub async fn update_remote_timestamp(
     // Parse URL
     let parsed_url = Url::parse(url)?;
 
-    // Get relative path
-    let relative_path = if path.is_absolute() {
-        path.strip_prefix(&workspace).unwrap_or(path).to_path_buf()
-    } else {
+    // Canonicalize path to be relative to workspace
+    let absolute_path = if path.is_absolute() {
         path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
+    let relative_path = absolute_path
+        .strip_prefix(&workspace)
+        .unwrap_or(&absolute_path)
+        .to_path_buf();
 
     // Load existing tracking
     let mut tracking_entries = read_remote_entries(&stencila_dir).await?;
@@ -560,7 +641,7 @@ pub async fn update_remote_timestamp(
         let mut found_watch = None;
         for (path_key, value) in remotes {
             for target in value.to_vec() {
-                if target.url() == url {
+                if target.url() == Some(url) {
                     found_path = Some(path_key.clone());
                     found_watch = target.watch().map(|s| s.to_string());
                     break;
@@ -591,6 +672,7 @@ pub async fn update_remote_timestamp(
             pushed_at: None,
             watch_id,
             watch_direction: None,
+            arguments: None,
         });
 
     if let Some(pulled) = pulled_at {
@@ -604,6 +686,99 @@ pub async fn update_remote_timestamp(
     write_remote_entries(&stencila_dir, &tracking_entries).await?;
 
     Ok(())
+}
+
+/// Update remote tracking with spread arguments after push
+///
+/// This is used when pushing spread variants to track each variant's URL
+/// along with its specific argument values.
+pub async fn update_spread_remote_timestamp(
+    path: &Path,
+    url: &str,
+    arguments: &std::collections::HashMap<String, String>,
+    pushed_at: u64,
+) -> Result<()> {
+    let workspace = closest_workspace_dir(path, false).await?;
+    let stencila_dir = closest_stencila_dir(path, true).await?;
+
+    // Parse URL
+    let parsed_url = Url::parse(url)?;
+
+    // Canonicalize path to be relative to workspace
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let relative_path = absolute_path
+        .strip_prefix(&workspace)
+        .unwrap_or(&absolute_path)
+        .to_path_buf();
+
+    // Load existing tracking
+    let mut tracking_entries = read_remote_entries(&stencila_dir).await?;
+
+    // Load config to find path and watch info
+    let config = stencila_config::config(path)?;
+    let config_path = if let Some(remotes) = &config.remotes {
+        // Find the remote config that matches this URL
+        let mut found_path = None;
+        for (path_key, value) in remotes {
+            for target in value.to_vec() {
+                if target.url() == Some(url) {
+                    found_path = Some(path_key.clone());
+                    break;
+                }
+            }
+            if found_path.is_some() {
+                break;
+            }
+        }
+        found_path.unwrap_or_else(|| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
+    };
+
+    // Update or create entry
+    let file_entry = tracking_entries.entry(relative_path).or_default();
+
+    // Get or create the remote entry with arguments
+    let remote_entry = file_entry
+        .entry(parsed_url.clone())
+        .or_insert_with(|| RemoteInfo {
+            url: parsed_url.clone(),
+            path: ConfigRelativePath(config_path),
+            pulled_at: None,
+            pushed_at: None,
+            watch_id: None,
+            watch_direction: None,
+            arguments: None,
+        });
+
+    remote_entry.pushed_at = Some(pushed_at);
+    remote_entry.arguments = Some(arguments.clone());
+
+    // Write back
+    write_remote_entries(&stencila_dir, &tracking_entries).await?;
+
+    Ok(())
+}
+
+/// Find a remote matching the given arguments
+///
+/// Searches through a list of remotes to find one with matching argument values.
+/// Returns the first remote that has arguments matching exactly.
+pub fn find_remote_for_arguments<'a>(
+    remotes: &'a [RemoteInfo],
+    arguments: &std::collections::HashMap<String, String>,
+) -> Option<&'a RemoteInfo> {
+    remotes.iter().find(|remote| {
+        if let Some(remote_args) = &remote.arguments {
+            remote_args == arguments
+        } else {
+            false
+        }
+    })
 }
 
 /// Expand a path into a list of files
@@ -680,7 +855,10 @@ pub async fn get_all_remote_entries(workspace_dir: &Path) -> Result<Option<Remot
             };
 
             for target in value.to_vec() {
-                let remote_url = target.url_owned();
+                // Skip Spread targets which don't have URLs
+                let Some(remote_url) = target.url_owned() else {
+                    continue;
+                };
                 let watch_id = target.watch().map(|s| s.to_string());
 
                 for file in &files {
@@ -703,6 +881,7 @@ pub async fn get_all_remote_entries(workspace_dir: &Path) -> Result<Option<Remot
                         pushed_at: existing.and_then(|t| t.pushed_at),
                         watch_id: watch_id.clone(),
                         watch_direction: None, // Will be filled from Cloud API later if needed
+                        arguments: existing.and_then(|t| t.arguments.clone()),
                     };
 
                     // Add remote to tracking
@@ -725,8 +904,8 @@ pub async fn get_all_remote_entries(workspace_dir: &Path) -> Result<Option<Remot
             // Resolve the tracked path relative to workspace
             let absolute_tracked_path = workspace_dir.join(tracked_path);
 
-            // Check if this file is under site root
-            if !config.path_matches_site_root(&absolute_tracked_path, workspace_dir) {
+            // Check if this file is under site root (or is the site root itself)
+            if !config.path_is_in_site_root(&absolute_tracked_path, workspace_dir) {
                 continue;
             }
 
@@ -748,13 +927,15 @@ pub async fn get_all_remote_entries(workspace_dir: &Path) -> Result<Option<Remot
                 }
 
                 // Create implicit remote info
+                // Site watches are stored in [site].watch, not [remotes]
                 let file_remote_info = RemoteInfo {
                     url: remote_url.clone(),
                     path: ConfigRelativePath(tracked_path.to_string_lossy().to_string()),
                     pulled_at: tracking_info.pulled_at,
                     pushed_at: tracking_info.pushed_at,
-                    watch_id: None, // Implicit remotes don't have watches
-                    watch_direction: None,
+                    watch_id: site_config.watch.clone(),
+                    watch_direction: site_config.watch.as_ref().map(|_| WatchDirection::ToRemote),
+                    arguments: tracking_info.arguments.clone(),
                 };
 
                 // Add implicit remote
@@ -763,6 +944,34 @@ pub async fn get_all_remote_entries(workspace_dir: &Path) -> Result<Option<Remot
                     .or_default()
                     .insert(remote_url.clone(), file_remote_info);
             }
+        }
+    }
+
+    // Process any tracked remotes that aren't already in the result
+    // These may be created via spread push or other operations without explicit [remotes] entries
+    for (tracked_path, url_map) in &remotes_tracking {
+        for (remote_url, tracking_info) in url_map {
+            // Skip if we already have this remote from explicit config or implicit site remotes
+            if result.contains_key(tracked_path) && result[tracked_path].contains_key(remote_url) {
+                continue;
+            }
+
+            // Create implicit remote info
+            let file_remote_info = RemoteInfo {
+                url: remote_url.clone(),
+                path: ConfigRelativePath(tracked_path.to_string_lossy().to_string()),
+                pulled_at: tracking_info.pulled_at,
+                pushed_at: tracking_info.pushed_at,
+                watch_id: None, // Implicit remotes don't have watches
+                watch_direction: None,
+                arguments: tracking_info.arguments.clone(),
+            };
+
+            // Add implicit remote
+            result
+                .entry(tracked_path.clone())
+                .or_default()
+                .insert(remote_url.clone(), file_remote_info);
         }
     }
 
@@ -795,8 +1004,8 @@ pub async fn update_watch_id(path: &Path, url: &str, watch_id: Option<String>) -
 /// for display purposes.
 pub async fn remove_deleted_watches(
     path: &Path,
-    valid_watch_ids: &HashSet<u64>,
-) -> Result<Vec<(PathBuf, Url, u64)>> {
+    valid_watch_ids: &HashSet<String>,
+) -> Result<Vec<(PathBuf, Url, String)>> {
     let mut deleted_watches = Vec::new();
 
     // Load the config to find remotes with watch IDs
@@ -810,13 +1019,12 @@ pub async fn remove_deleted_watches(
     // Check each remote for watch IDs that need to be removed
     for (path_key, value) in remotes {
         for target in value.to_vec() {
-            if let Some(watch_id_str) = target.watch()
-                && let Ok(watch_id) = watch_id_str.parse::<u64>()
-                && !valid_watch_ids.contains(&watch_id)
+            if let Some(watch_id) = target.watch()
+                && !valid_watch_ids.contains(watch_id)
+                && let Some(url_str) = target.url()
             {
                 // Watch no longer exists, remove it from config
                 let remote_path = ConfigRelativePath(path_key.clone()).resolve(&workspace_dir);
-                let url_str = target.url();
 
                 // Remove the watch ID from the config
                 if stencila_config::config_update_remote_watch(
@@ -826,7 +1034,7 @@ pub async fn remove_deleted_watches(
                 )
                 .is_ok()
                 {
-                    deleted_watches.push((remote_path, Url::parse(url_str)?, watch_id));
+                    deleted_watches.push((remote_path, Url::parse(url_str)?, watch_id.to_string()));
                 }
             }
         }
