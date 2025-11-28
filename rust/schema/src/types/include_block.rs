@@ -3,6 +3,7 @@
 use crate::prelude::*;
 
 use super::block::Block;
+use super::call_argument::CallArgument;
 use super::compilation_digest::CompilationDigest;
 use super::compilation_message::CompilationMessage;
 use super::duration::Duration;
@@ -65,6 +66,19 @@ pub struct IncludeBlock {
     #[patch(format = "md", format = "smd", format = "myst", format = "ipynb", format = "qmd")]
     #[cfg_attr(feature = "proptest", proptest(value = "None"))]
     pub select: Option<String>,
+
+    /// The value of arguments to pass to the included content
+    #[serde(alias = "argument")]
+    #[serde(deserialize_with = "one_or_many")]
+    #[serde(default)]
+    #[strip(code)]
+    #[patch(format = "md", format = "smd", format = "myst", format = "ipynb", format = "qmd")]
+    #[cfg_attr(feature = "proptest-min", proptest(value = r#"Vec::new()"#))]
+    #[cfg_attr(feature = "proptest-low", proptest(strategy = r#"vec(CallArgument::arbitrary(), size_range(0..=3))"#))]
+    #[cfg_attr(feature = "proptest-high", proptest(strategy = r#"vec(CallArgument::arbitrary(), size_range(0..=10))"#))]
+    #[cfg_attr(feature = "proptest-max", proptest(strategy = r#"vec(CallArgument::arbitrary(), size_range(0..=10))"#))]
+    #[dom(elem = "div")]
+    pub arguments: Vec<CallArgument>,
 
     /// The structured content decoded from the source.
     #[serde(default, deserialize_with = "option_one_or_many")]

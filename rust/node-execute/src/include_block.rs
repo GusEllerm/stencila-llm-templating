@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use stencila_codecs::DecodeOptions;
-use stencila_schema::{Block, CompilationMessage, IncludeBlock};
+use stencila_schema::{Block, CompilationMessage, IncludeBlock, Node};
 
 use crate::prelude::*;
 
@@ -17,6 +17,11 @@ impl Executable for IncludeBlock {
 
         let node_id = self.node_id();
         tracing::trace!("Compiling IncludeBlock {node_id}");
+
+        // Note: We don't evaluate arguments here during compile time because:
+        // 1. Expressions like {{site}} may reference variables that don't exist yet (e.g., in ForBlock iterations)
+        // 2. Arguments will be evaluated and set during the execute phase when variables are available
+        // For now, we just compile the content - argument evaluation happens in execute()
 
         // Get the content from the source
         let (content, pop_dir, mut messages) =
@@ -41,6 +46,7 @@ impl Executable for IncludeBlock {
 
         // Compile the content. This needs to be done here between (possibly)
         // pushing and popping from the directory stack.
+        // Arguments are now available as variables in the kernel for the included content
         if let Err(error) = self.content.walk_async(executor).await {
             messages.push(error_to_compilation_message(error));
         };
@@ -69,9 +75,62 @@ impl Executable for IncludeBlock {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn execute(&mut self, _executor: &mut Executor) -> WalkControl {
+    async fn execute(&mut self, executor: &mut Executor) -> WalkControl {
         let node_id = self.node_id();
         tracing::debug!("Executing IncludeBlock {node_id}: {}", self.source);
+
+        // Evaluate arguments and set them as variables in the kernel before executing content
+        // This happens at execution time so variables from ForBlock iterations are available
+        if !self.arguments.is_empty() {
+            let lang = executor.programming_language(&None);
+            let mut kernels = executor.kernels.write().await;
+            
+            for arg in &self.arguments {
+                let arg_name = &arg.name;
+                let arg_value = if !arg.code.is_empty() {
+                    // Evaluate the code expression (e.g., {{site}} or just site)
+                    // Strip {{}} wrapper if present
+                    let code_to_eval = arg.code.trim();
+                    let code_to_eval = if code_to_eval.starts_with("{{") && code_to_eval.ends_with("}}") {
+                        &code_to_eval[2..code_to_eval.len()-2].trim()
+                    } else {
+                        code_to_eval
+                    };
+                    
+                    // Try to get the value from the kernel (e.g., if code is "site", get variable "site")
+                    match kernels.get(code_to_eval).await {
+                        Ok(Some(node)) => {
+                            tracing::debug!("Evaluated argument '{}' from code '{}' to value", arg_name, code_to_eval);
+                            Some(node)
+                        }
+                        Ok(None) => {
+                            // Variable not found in kernel - might not be set yet
+                            tracing::debug!("Argument '{}' code '{}' not found in kernel", arg_name, code_to_eval);
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("Error getting argument '{}' from kernel: {}", arg_name, e);
+                            None
+                        }
+                    }
+                } else if let Some(value) = &arg.value {
+                    // Use the literal value
+                    Some(value.as_ref().clone())
+                } else {
+                    None
+                };
+
+                if let Some(value) = arg_value {
+                    // Set the variable in the kernel with the argument name
+                    if let Err(error) = kernels.set(arg_name, &value, lang.as_deref()).await {
+                        tracing::warn!("Error setting argument '{}' in kernel: {}", arg_name, error);
+                    } else {
+                        tracing::debug!("Set argument '{}' in kernel for included content", arg_name);
+                    }
+                }
+            }
+            drop(kernels); // Release the lock before continuing
+        }
 
         // Continue walk to execute nodes in `content`
         WalkControl::Continue

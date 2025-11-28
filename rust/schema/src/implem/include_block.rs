@@ -107,6 +107,55 @@ impl MarkdownCodec for IncludeBlock {
                 .push_str(" include ")
                 .push_prop_str(NodeProperty::Source, &self.source);
 
+            // Encode CLI-style arguments (--name=value)
+            if !self.arguments.is_empty() {
+                for arg in &self.arguments {
+                    context.push_str(" --");
+                    context.push_str(&arg.name);
+                    context.push_str("=");
+                    
+                    // Encode the argument value
+                    if !arg.code.is_empty() {
+                        // If it's an expression (like {{site}}), check if it needs wrapping
+                        let code_str = arg.code.to_string();
+                        if code_str.starts_with("{{") && code_str.ends_with("}}") {
+                            // Already wrapped, use as-is
+                            context.push_str(&code_str);
+                        } else {
+                            // Wrap in {{}} for expressions
+                            context.push_str("{{");
+                            context.push_str(&code_str);
+                            context.push_str("}}");
+                        }
+                    } else if let Some(value) = &arg.value {
+                        // Encode the literal value
+                        match value.as_ref() {
+                            Node::String(s) => {
+                                // Quote strings
+                                context.push_str("\"");
+                                context.push_str(s);
+                                context.push_str("\"");
+                            }
+                            Node::Number(n) => {
+                                context.push_str(&n.to_string());
+                            }
+                            Node::Integer(i) => {
+                                context.push_str(&i.to_string());
+                            }
+                            Node::Boolean(b) => {
+                                context.push_str(&b.to_string());
+                            }
+                            _ => {
+                                // For other types, try to serialize as JSON
+                                if let Ok(json) = serde_json::to_string(value.as_ref()) {
+                                    context.push_str(&json);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if self.execution_mode.is_some() || self.media_type.is_some() || self.select.is_some() {
                 context.push_str(" {");
 

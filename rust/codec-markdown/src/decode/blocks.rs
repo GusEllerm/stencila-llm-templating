@@ -614,17 +614,81 @@ fn call_block(input: &mut Located<&str>) -> ModalResult<Block> {
     .parse_next(input)
 }
 
+/// Parse a CLI-style argument for include blocks: --name=value or --name="value" or --name={{expr}}
+/// This follows the same pattern as call_arg but parses --name=value instead of name=value
+fn include_cli_arg(input: &mut Located<&str>) -> ModalResult<CallArgument> {
+    preceded(
+        ("--", multispace0),
+        (
+            terminated(name, delimited(multispace0, "=", multispace0)),
+            alt((
+                // Inline expression {{...}} - store as code (like backticks in call_arg)
+                delimited("{{", take_until(0.., "}}"), "}}").map(|code| (code, None)),
+                // Quoted string - store as code
+                delimited('"', take_until(0.., '"'), '"').map(|code| (code, None)),
+                delimited('\'', take_until(0.., '\''), '\'').map(|code| (code, None)),
+                // Unquoted value - try as primitive first, otherwise as string code
+                // This matches call_arg exactly: primitive uses "", code uses Located<&str>
+                alt((
+                    primitive_node.map(|node| ("", Some(node))),
+                    take_while(1.., |c| c != ' ' && c != '\t' && c != '\n' && c != '{')
+                        .map(|code| (code, None)),
+                )),
+            )),
+        ),
+    )
+    .map(|(name, (code, value))| CallArgument {
+        name: name.into(),
+        code: code.into(),
+        value: value.map(Box::new),
+        ..Default::default()
+    })
+    .parse_next(input)
+}
+
 /// Parse an [`IncludeBlock`] node
 fn include_block(input: &mut Located<&str>) -> ModalResult<Block> {
     preceded(
         ("include", multispace0),
-        (take_while(0.., |c| c != '{'), opt(attrs)),
+        (
+            // Parse everything until newline or '{' (for attrs at the end)
+            // Don't stop at '{' in the middle (e.g., in {{site}} expressions)
+            // We'll split on ' --' pattern in the map function
+            take_while(0.., |c| c != '\n'),
+            // Parse attributes (the {format="smd"} part) - only if at the end
+            opt(attrs),
+        ),
     )
-    .map(|(source, attrs)| {
+    .map(|(source_and_args, attrs)| {
         let mut options: IndexMap<&str, _> = attrs.unwrap_or_default().into_iter().collect();
+        
+        // Split source and arguments on ' --' pattern (space followed by --)
+        // But we need to be careful: attributes like {format="smd"} might come after
+        let source_str = source_and_args.trim();
+        
+        // First, check if there are attributes at the end (they were already parsed)
+        // If attrs exist, they were consumed, so source_and_args doesn't include them
+        // Now split on ' --' to separate source from arguments
+        let (source, arguments) = if let Some(pos) = source_str.find(" --") {
+            let (src, args_str) = source_str.split_at(pos);
+            // Parse the arguments part (skip the leading space)
+            let args_str = args_str.trim_start(); // This removes the space before --
+            let mut arg_input = Located::new(args_str);
+            match separated(0.., include_cli_arg, multispace1).parse_next(&mut arg_input) {
+                Ok(args) => (src.trim().to_string(), args),
+                Err(e) => {
+                    // Parsing failed, treat everything as source (including the -- part)
+                    tracing::debug!("Failed to parse arguments: {:?}", e);
+                    (source_str.to_string(), Vec::new())
+                }
+            }
+        } else {
+            (source_str.to_string(), Vec::new())
+        };
 
         Block::IncludeBlock(IncludeBlock {
-            source: source.trim().to_string(),
+            source,
+            arguments,
             media_type: options.swap_remove("format").flatten().map(node_to_string),
             select: options.swap_remove("select").flatten().map(node_to_string),
             execution_mode: execution_mode_from_options(options),
