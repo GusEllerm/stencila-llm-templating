@@ -11,3 +11,8 @@ node_modules
 /target
 /codecov
 /codecov.*
+
+# Cargo cache and build artifacts (but keep config files)
+.cargo/
+!.cargo/config.toml
+!.cargo/audit.toml

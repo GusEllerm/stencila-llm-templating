@@ -191,5 +191,6 @@
         "yamls",
         "zenodo",
         "Zstandard"
-    ]
+    ],
+    "git.ignoreLimitWarning": true
 }

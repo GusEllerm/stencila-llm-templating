@@ -1,0 +1,24 @@
+# Production Dockerfile for Stencila
+# This assumes you've built the binary in the dev container
+# 
+# To use this:
+# 1. Build the binary in the dev container: cd rust && cargo build --bin stencila --release
+# 2. Copy the binary to the project root: cp rust/target/release/stencila ./stencila
+# 3. Build this image: docker build -f Dockerfile.production -t stencila:custom .
+
+FROM ubuntu:24.04
+
+# Install minimal runtime dependencies if needed
+RUN apt-get update && apt-get install -y \
+	ca-certificates \
+	&& apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+# Copy the pre-built binary
+COPY stencila /stencila
+
+# Expose the default Stencila port
+EXPOSE 9000
+
+# Set the entry point to run the Stencila binary
+ENTRYPOINT ["/stencila"]
+CMD []

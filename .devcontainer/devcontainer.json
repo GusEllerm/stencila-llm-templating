@@ -1,0 +1,55 @@
+{
+	"name": "Stencila Development",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": ".."
+	},
+	"workspaceFolder": "/workspace",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+	"features": {},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"dbaeumer.vscode-eslint",
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"tamasfe.even-better-toml",
+				"serayuzgur.crates"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "zsh",
+				"terminal.integrated.profiles.linux": {
+					"zsh": {
+						"path": "/usr/bin/zsh"
+					}
+				},
+				"rust-analyzer.checkOnSave": true,
+				"rust-analyzer.check.command": "clippy",
+				"rust-analyzer.cargo.allFeatures": true,
+				"editor.formatOnSave": true,
+				"[rust]": {
+					"editor.defaultFormatter": "rust-lang.rust-analyzer",
+					"editor.formatOnSave": true
+				},
+				"[typescript]": {
+					"editor.defaultFormatter": "dbaeumer.vscode-eslint",
+					"editor.formatOnSave": true
+				},
+				"[python]": {
+					"editor.defaultFormatter": "ms-python.black-formatter",
+					"editor.formatOnSave": true
+				}
+			}
+		}
+	},
+	"forwardPorts": [
+		9000
+	],
+	"postCreateCommand": "bash .devcontainer/postCreate.sh",
+	"remoteUser": "vscode",
+	"mounts": [
+		"source=${localWorkspaceFolder}/.cargo,target=/home/vscode/.cargo,type=bind,consistency=cached"
+	]
+}
