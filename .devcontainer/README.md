@@ -103,7 +103,7 @@ This container can be used as a Stencila tool provider for other containers. See
 
 **Quick Start:**
 1. Add the `stencila-tool` service to your `docker-compose.yml` (see [`docker-compose.tool-example.yml`](./docker-compose.tool-example.yml))
-2. Execute Stencila commands: `docker exec stencila-tool /workspace/rust/target/release/stencila <command>`
+2. Execute Stencila commands: `docker exec stencila-tool /workspace/target/release/stencila <command>`
 3. Rebuild Stencila when needed: `docker exec stencila-tool bash -c "cd /workspace/rust && cargo build --bin stencila --release"`
 
 ## Helper Scripts
@@ -116,11 +116,46 @@ Builds the Stencila binary (debug or release) and optionally exports it:
 ./prepare-binary.sh release /path/to/out  # Build and export to path
 ```
 
+### `build-with-progress.sh`
+Builds Stencila with progress monitoring and time estimates:
+```bash
+./build-with-progress.sh release  # Build release with progress tracking
+./build-with-progress.sh debug    # Build debug with progress tracking
+```
+This script shows:
+- Current progress (X/Y crates compiled)
+- Elapsed time
+- Estimated time remaining (ETA)
+
 ### `export-binary.sh`
 Exports the built release binary to a specified location:
 ```bash
 ./export-binary.sh              # Export to ./stencila
 ./export-binary.sh /path/to/out # Export to custom path
+```
+
+### Monitoring Build Progress
+
+For long release builds, you can monitor progress:
+
+**Option 1: Use the progress script**
+```bash
+./build-with-progress.sh release
+```
+
+**Option 2: Use cargo's built-in progress (already shown)**
+The progress bar `[=====================> ] 1070/1071` shows:
+- Current crate being built (1070)
+- Total crates (1071)
+- Approximate progress
+
+**Option 3: Check build timing manually**
+```bash
+# Start build with time tracking
+time cargo build --bin stencila --release
+
+# Or in another terminal, check what's compiling:
+watch -n 1 'ls -lt target/release/deps/*.rlib 2>/dev/null | head -5'
 ```
 
 ## Container Files
@@ -139,5 +174,5 @@ Exports the built release binary to a specified location:
 - All build artifacts will be in the container, but your source code edits are synced
 - The `rust-toolchain.toml` file automatically ensures the correct Rust version (1.89.0) is used
 - Binary locations:
-  - Debug: `/workspace/rust/target/debug/stencila`
-  - Release: `/workspace/rust/target/release/stencila`
+  - Debug: `/workspace/target/debug/stencila`
+  - Release: `/workspace/target/release/stencila`

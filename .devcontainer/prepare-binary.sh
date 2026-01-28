@@ -14,11 +14,13 @@ cd /workspace/rust
 if [ "$BUILD_TYPE" = "release" ]; then
     echo "Building release binary (optimized, smaller)..."
     cargo build --bin stencila --release
-    BINARY_PATH="/workspace/rust/target/release/stencila"
+    # Cargo workspace uses workspace-level target directory
+    BINARY_PATH="/workspace/target/release/stencila"
 else
     echo "Building debug binary (faster build, larger size)..."
     cargo build --bin stencila
-    BINARY_PATH="/workspace/rust/target/debug/stencila"
+    # Cargo workspace uses workspace-level target directory
+    BINARY_PATH="/workspace/target/debug/stencila"
 fi
 
 if [ ! -f "$BINARY_PATH" ]; then
@@ -44,4 +46,4 @@ echo "   docker exec <container-name> $BINARY_PATH --version"
 echo "   docker exec <container-name> $BINARY_PATH convert input.md output.html"
 echo ""
 echo "💡 Or mount the target directory:"
-echo "   -v /workspace/rust/target:/stencila-binaries:ro"
+echo "   -v /workspace/target:/stencila-binaries:ro"

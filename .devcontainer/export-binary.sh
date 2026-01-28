@@ -5,7 +5,8 @@
 set -euo pipefail
 
 OUTPUT_PATH="${1:-./stencila}"
-BINARY_PATH="/workspace/rust/target/release/stencila"
+# Cargo workspace uses workspace-level target directory
+BINARY_PATH="/workspace/target/release/stencila"
 
 echo "🔍 Checking if binary exists..."
 if [ ! -f "$BINARY_PATH" ]; then
