@@ -1,6 +1,6 @@
 # Stencila Dev Container
 
-This dev container provides a complete development environment for building Stencila from your fork.
+This dev container provides a complete development environment for building Stencila from your fork. It can also be used as a "tool container" that provides the Stencila CLI to other containers via docker-compose.
 
 ## What's Included
 
@@ -12,6 +12,8 @@ This dev container provides a complete development environment for building Sten
   - mold linker (faster Rust linking on Linux)
   - ruff and pyright (Python linting/type checking)
   - cargo-binstall (for installing Rust tools)
+- **Shell Environment**:
+  - zsh with Oh My Zsh and Powerlevel10k theme (installed via `postCreate.sh`)
 
 ## Getting Started
 
@@ -95,6 +97,40 @@ cd /workspace
 make -C python/stencila install
 ```
 
+## Using This Container as a Tool Provider
+
+This container can be used as a Stencila tool provider for other containers. See [`AGENT-PROMPT.md`](./AGENT-PROMPT.md) for detailed instructions on integrating this container with other projects via docker-compose.
+
+**Quick Start:**
+1. Add the `stencila-tool` service to your `docker-compose.yml` (see [`docker-compose.tool-example.yml`](./docker-compose.tool-example.yml))
+2. Execute Stencila commands: `docker exec stencila-tool /workspace/rust/target/release/stencila <command>`
+3. Rebuild Stencila when needed: `docker exec stencila-tool bash -c "cd /workspace/rust && cargo build --bin stencila --release"`
+
+## Helper Scripts
+
+### `prepare-binary.sh`
+Builds the Stencila binary (debug or release) and optionally exports it:
+```bash
+./prepare-binary.sh release              # Build release binary
+./prepare-binary.sh debug                # Build debug binary
+./prepare-binary.sh release /path/to/out  # Build and export to path
+```
+
+### `export-binary.sh`
+Exports the built release binary to a specified location:
+```bash
+./export-binary.sh              # Export to ./stencila
+./export-binary.sh /path/to/out # Export to custom path
+```
+
+## Container Files
+
+- **`devcontainer.json`** - VS Code dev container configuration
+- **`Dockerfile`** - Container image definition
+- **`postCreate.sh`** - Post-creation script that installs zsh, Oh My Zsh, Powerlevel10k, and development tools
+- **`AGENT-PROMPT.md`** - Instructions for other agents/projects to integrate this container via docker-compose
+- **`docker-compose.tool-example.yml`** - Example docker-compose configuration for using this container as a tool
+
 ## Notes
 
 - The container mounts your local `.cargo` directory to preserve Rust tool installations
@@ -102,3 +138,6 @@ make -C python/stencila install
 - The workspace is mounted at `/workspace` in the container
 - All build artifacts will be in the container, but your source code edits are synced
 - The `rust-toolchain.toml` file automatically ensures the correct Rust version (1.89.0) is used
+- Binary locations:
+  - Debug: `/workspace/rust/target/debug/stencila`
+  - Release: `/workspace/rust/target/release/stencila`
